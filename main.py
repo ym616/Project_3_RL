@@ -9,88 +9,80 @@ import gymnasium as gym
 from gymnasium import spaces
 from stable_baselines3 import PPO
 
-# ==============================================================================
-# Simulation & UI Configuration (Spacious 1200x760, Clean Human Design)
-# ==============================================================================
+# Window dimensions
 WINDOW_WIDTH = 1200
 WINDOW_HEIGHT = 760
 
-# Physical parameters (Cart + Inverted Double Pendulum)
-CART_MASS = 1.0       # kg (Mass of the cart)
-M1 = 0.4              # kg (Mass of link 1 bob)
-M2 = 0.3              # kg (Mass of link 2 bob)
-L1 = 0.55             # m  (Length of link 1)
-L2 = 0.45             # m  (Length of link 2)
-G = 9.81              # m/s^2 (Gravitational acceleration)
-MAX_FORCE = 25.0      # N  (Control force applied to cart)
-TRACK_LIMIT = 2.4     # m  (Physical boundary of rail track: [-2.4, +2.4])
-FRICTION_CART = 0.2   # Viscous damping on cart rail
-DAMPING_1 = 0.05      # Bearing friction on joint 1
-DAMPING_2 = 0.05      # Bearing friction on joint 2
+# Physical parameters in SI units
+CART_MASS = 1.0       # kg
+M1 = 0.4              # kg, lower link mass
+M2 = 0.3              # kg, upper link mass
+L1 = 0.55             # m, lower link length
+L2 = 0.45             # m, upper link length
+G = 9.81              # m/s^2
+MAX_FORCE = 25.0      # N, max horizontal cart force
+TRACK_LIMIT = 2.4     # m, half-width of the rail [-2.4, +2.4]
+FRICTION_CART = 0.2   # rail viscous damping
+DAMPING_1 = 0.05      # joint 1 damping
+DAMPING_2 = 0.05      # joint 2 damping
 
-# Clean Studio Palette (Human, Light, High-Contrast)
-COLOR_BG = (245, 247, 250)         # Soft light studio background (#f5f7fa)
-COLOR_CARD_BG = (255, 255, 255)    # Card surface pure white
-COLOR_BORDER = (226, 230, 236)     # Crisp card border (#e2e6ec)
-COLOR_GRID = (238, 241, 246)       # Subtle grid lines
-COLOR_TEXT_DARK = (30, 36, 48)     # Primary charcoal text (#1e2430)
-COLOR_TEXT_MUTED = (100, 110, 125) # Secondary slate gray text (#646e7d)
+# UI colors
+COLOR_BG = (245, 247, 250)
+COLOR_CARD_BG = (255, 255, 255)
+COLOR_BORDER = (226, 230, 236)
+COLOR_GRID = (238, 241, 246)
+COLOR_TEXT_DARK = (30, 36, 48)
+COLOR_TEXT_MUTED = (100, 110, 125)
 
-# Accent Colors
-COLOR_PRIMARY = (37, 99, 235)      # Clean Royal Blue (#2563eb)
-COLOR_SUCCESS = (16, 185, 129)     # Emerald Green (#10b981)
-COLOR_AMBER = (245, 158, 11)       # Warm Amber (#f59e0b)
-COLOR_DANGER = (239, 68, 68)       # Crimson Red (#ef4444)
+COLOR_PRIMARY = (37, 99, 235)
+COLOR_SUCCESS = (16, 185, 129)
+COLOR_AMBER = (245, 158, 11)
+COLOR_DANGER = (239, 68, 68)
 
-COLOR_RAIL = (195, 202, 212)       # Aluminum track rail (#c3cad4)
-COLOR_ROD_1 = (45, 55, 72)         # Link 1 dark slate
-COLOR_ROD_2 = (37, 99, 235)        # Link 2 primary blue
-COLOR_WHEEL = (100, 110, 125)      # Wheel graphite
+COLOR_RAIL = (195, 202, 212)
+COLOR_ROD_1 = (45, 55, 72)
+COLOR_ROD_2 = (37, 99, 235)
+COLOR_WHEEL = (100, 110, 125)
 
 SPEED_PRESETS = [30, 60, 120, 240, 600]
 SPEED_LABELS = ["30 FPS (0.5x)", "60 FPS (1.0x)", "120 FPS (2.0x)", "240 FPS (4.0x)", "Turbo (Max)"]
 
-# High-precision Riccati gain matrix for upright tracking and recovery
+# LQR gains used to generate training targets for the policy
 K_TRACK = np.array([45.563, 69.069, -646.884, 2.661, 1108.915, 171.236], dtype=np.float64)
 
 
 class InteractiveDoublePendulumEnv(gym.Env):
-    """
-    Cart + Double Inverted Pendulum Environment.
-    Endless interactive sandbox with zero arbitrary fall resets and active recovery.
-    """
+    """Cart-pole double pendulum environment without fall-based episode resets."""
     metadata = {"render_modes": ["human"]}
 
     def __init__(self, render_mode="human"):
         super().__init__()
         self.render_mode = render_mode
 
-        # Continuous action: horizontal control force in [-1.0, 1.0]
+        # Normalized horizontal force in [-1, 1]
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32)
 
-        # Observation: [(cart_x - target_x)/2.4, cart_v/5.0, cos(t1), sin(t1), w1/10.0, cos(t2), sin(t2), w2/10.0]
+        # Obs: [cart_err, cart_v, cos(t1), sin(t1), w1, cos(t2), sin(t2), w2]
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(8,), dtype=np.float32)
 
-        # Simulation timing: 50 Hz control step with RK4 substepping
+        # 50 Hz control step, 4 RK4 substeps per step (sub_dt = 0.005s)
         self.dt = 0.02
         self.n_substeps = 4
         self.sub_dt = self.dt / self.n_substeps
 
-        # State: [cart_x, cart_v, t1, w1, t2, w2]
-        # Angles: 0 is upright (vertical inverted balance), +-pi is hanging down
+        # Angles: 0 is straight up, +-pi is hanging straight down
         self.cart_x = 0.0
         self.cart_v = 0.0
         self.t1 = 0.0
         self.t2 = 0.0
         self.w1 = 0.0
         self.w2 = 0.0
-        self.target_x = 0.0  # Commanded target position
+        self.target_x = 0.0
 
-        # Statistics
         self.step_count = 0
         self.episode_reward = 0.0
 
-        # Interactive controls & UI state
+        # UI / input state
         self.manual_mode = False
         self.paused = False
         self.speed_idx = 1
@@ -98,10 +90,8 @@ class InteractiveDoublePendulumEnv(gym.Env):
         self.should_close = False
         self.dragging = None
 
-        # Visual history
         self.height_history = []
 
-        # Pygame resources
         self.screen = None
         self.clock = None
         self.font = None
@@ -184,12 +174,12 @@ class InteractiveDoublePendulumEnv(gym.Env):
 
             state += (sub_dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
 
-            # Safeguards
+            # Clamp velocities to keep integration numerically stable on large kicks
             state[1] = np.clip(state[1], -15.0, 15.0)
             state[3] = np.clip(state[3], -35.0, 35.0)
             state[5] = np.clip(state[5], -35.0, 35.0)
 
-        # Soft elastic bumper at track boundaries (cart stays smoothly on track)
+        # Elastic bounce at track ends so the cart stays on the rail
         if state[0] > TRACK_LIMIT:
             state[0] = TRACK_LIMIT
             state[1] = -0.3 * abs(state[1])
@@ -202,7 +192,6 @@ class InteractiveDoublePendulumEnv(gym.Env):
         self.t2 = (self.t2 + math.pi) % (2.0 * math.pi) - math.pi
 
     def _handle_events(self):
-        """Processes keyboard, mouse, and window events with instant responsiveness."""
         mouse_pos = pygame.mouse.get_pos()
         scale = 200.0
         center_x = WINDOW_WIDTH // 2
@@ -234,7 +223,7 @@ class InteractiveDoublePendulumEnv(gym.Env):
                 elif event.key == pygame.K_r:
                     self.reset()
                 elif event.key == pygame.K_SPACE:
-                    # Disturbance kick that the balancer can actively recover from
+                    # Apply a random velocity impulse to test recovery
                     direction = float(self.np_random.choice([-1.0, 1.0]))
                     self.cart_v += direction * 0.4
                     self.w1 += direction * 0.45
@@ -247,7 +236,6 @@ class InteractiveDoublePendulumEnv(gym.Env):
                     self.render_fps = SPEED_PRESETS[self.speed_idx]
 
             elif event.type == pygame.MOUSEMOTION:
-                # In manual mode, mouse movement smoothly updates cart target position
                 if self.manual_mode and 120 <= event.pos[1] <= 640:
                     raw_target = (event.pos[0] - center_x) / scale
                     self.target_x = float(np.clip(raw_target, -TRACK_LIMIT + 0.2, TRACK_LIMIT - 0.2))
@@ -255,31 +243,28 @@ class InteractiveDoublePendulumEnv(gym.Env):
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 mx, my = event.pos
 
-                # Header Buttons (Clean, Spacious Layout)
-                # 1. Mode Toggle [750..890, 24..60]
-                if 750 <= mx <= 890 and 24 <= my <= 60:
+                # Header buttons
+                if 800 <= mx <= 940 and 24 <= my <= 60:
                     self.manual_mode = not self.manual_mode
                     if self.manual_mode:
                         self.target_x = self.cart_x
                     else:
                         self.target_x = 0.0
                     continue
-                # 2. Pause Button [905..1005, 24..60]
-                if 905 <= mx <= 1005 and 24 <= my <= 60:
+                if 955 <= mx <= 1055 and 24 <= my <= 60:
                     self.paused = not self.paused
                     continue
-                # 3. Reset Button [1020..1110, 24..60]
-                if 1020 <= mx <= 1110 and 24 <= my <= 60:
+                if 1070 <= mx <= 1160 and 24 <= my <= 60:
                     self.reset()
                     continue
 
-                # Speed badge click on left panel
-                if 28 <= mx <= 270 and 88 <= my <= 124:
+                # Speed badge on left panel
+                if 24 <= mx <= 334 and 86 <= my <= 124:
                     self.speed_idx = (self.speed_idx + 1) % len(SPEED_PRESETS)
                     self.render_fps = SPEED_PRESETS[self.speed_idx]
                     continue
 
-                # Mouse click on track sets target and activates manual mode
+                # Click near tip to drag pendulum, otherwise set cart target
                 dist_tip = math.hypot(mx - x2_px, my - y2_px)
                 if dist_tip < 35:
                     self.dragging = "tip"
@@ -291,7 +276,6 @@ class InteractiveDoublePendulumEnv(gym.Env):
             elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
                 self.dragging = None
 
-        # Continuous Mouse Dragging
         if self.manual_mode:
             mouse_buttons = pygame.mouse.get_pressed()
             if mouse_buttons[0] or self.dragging == "target":
@@ -307,7 +291,6 @@ class InteractiveDoublePendulumEnv(gym.Env):
             self.w1 = 0.0
             self.w2 = 0.0
 
-        # Continuous keyboard driving for manual steer
         keys = pygame.key.get_pressed()
         steer_speed = 3.2 * self.dt
         if keys[pygame.K_LEFT] or keys[pygame.K_a]:
@@ -318,20 +301,14 @@ class InteractiveDoublePendulumEnv(gym.Env):
             self.target_x = float(np.clip(self.target_x + steer_speed, -TRACK_LIMIT + 0.2, TRACK_LIMIT - 0.2))
 
     def step(self, action):
-        """
-        Executes physics step for the action without forcing arbitrary fall resets.
-        Simulation runs endlessly until manually reset or closed.
-        """
         if self.should_close:
             return self._get_obs(), 0.0, True, False, {}
 
-        # 1. Process Pygame events
         if self.render_mode == "human":
             if self.screen is None:
                 self._init_pygame()
             self._handle_events()
 
-        # 2. Pause loop
         while self.paused and not self.should_close:
             self._handle_events()
             self.render()
@@ -339,27 +316,23 @@ class InteractiveDoublePendulumEnv(gym.Env):
         if self.should_close:
             return self._get_obs(), 0.0, True, False, {}
 
-        # 3. Apply the RL neural network action directly to the physical system
         applied_action = float(np.clip(action[0], -1.0, 1.0))
         force = applied_action * MAX_FORCE
 
-        # 4. Integrate physics with RK4
         self._rk4_integrate(force)
         self.step_count += 1
 
-        # 5. Reward calculation
         tip_y = L1 * math.cos(self.t1) + L2 * math.cos(self.t2)
         total_len = L1 + L2
         dist_to_target = abs(self.cart_x - self.target_x)
 
         reward = 8.0 + 4.0 * (tip_y / total_len) - 2.0 * (dist_to_target ** 2) - 0.002 * (self.w1 ** 2 + self.w2 ** 2)
 
-        # Endless Sandbox: NEVER terminates from angles or step counts!
+        # Keep running continuously; don't reset on fall angles or step limits
         terminated = False
         truncated = False
         self.episode_reward += reward
 
-        # Record tip height for sparkline
         self.height_history.append(tip_y)
         if len(self.height_history) > 160:
             self.height_history.pop(0)
@@ -382,10 +355,9 @@ class InteractiveDoublePendulumEnv(gym.Env):
 
         mouse_pos = pygame.mouse.get_pos()
 
-        # 1. Background (Clean, Soft Studio Aesthetic)
+        # Background and grid
         self.screen.fill(COLOR_BG)
 
-        # Subtle clean grid
         for x in range(0, WINDOW_WIDTH, 48):
             pygame.draw.line(self.screen, COLOR_GRID, (x, 0), (x, WINDOW_HEIGHT), 1)
         for y in range(0, WINDOW_HEIGHT, 48):
@@ -396,7 +368,7 @@ class InteractiveDoublePendulumEnv(gym.Env):
         track_y = 410
         track_half_width = int(TRACK_LIMIT * scale)
 
-        # 2. Track Rail & Boundary Bumpers (Clean Modern Hardware Style)
+        # Rail and end bumpers
         rail_rect = (center_x - track_half_width - 15, track_y - 4, 2 * track_half_width + 30, 8)
         pygame.draw.rect(self.screen, COLOR_RAIL, rail_rect, border_radius=4)
         pygame.draw.line(self.screen, COLOR_TEXT_MUTED, (center_x, track_y - 12), (center_x, track_y + 12), 2)
@@ -404,13 +376,12 @@ class InteractiveDoublePendulumEnv(gym.Env):
             tx = center_x + int(m * scale)
             pygame.draw.line(self.screen, COLOR_BORDER, (tx, track_y - 8), (tx, track_y + 8), 1)
 
-        # Soft bumpers
         left_bumper = (center_x - track_half_width - 16, track_y - 20, 12, 40)
         right_bumper = (center_x + track_half_width + 4, track_y - 20, 12, 40)
         pygame.draw.rect(self.screen, COLOR_DANGER, left_bumper, border_radius=4)
         pygame.draw.rect(self.screen, COLOR_DANGER, right_bumper, border_radius=4)
 
-        # Target Position Indicator on Track (Diamond reticle)
+        # Target position marker
         target_px = center_x + int(self.target_x * scale)
         reticle_color = COLOR_AMBER if self.manual_mode else COLOR_PRIMARY
         reticle_surf = pygame.Surface((WINDOW_WIDTH, WINDOW_HEIGHT), pygame.SRCALPHA)
@@ -419,14 +390,14 @@ class InteractiveDoublePendulumEnv(gym.Env):
         pygame.draw.polygon(reticle_surf, reticle_color, pts)
         self.screen.blit(reticle_surf, (0, 0))
 
-        # 3. Cart & Joint Calculations
+        # Pendulum joint screen coordinates
         cart_pixel_x = center_x + int(self.cart_x * scale)
         x1_px = cart_pixel_x + int(L1 * scale * math.sin(self.t1))
         y1_px = track_y - int(L1 * scale * math.cos(self.t1))
         x2_px = x1_px + int(L2 * scale * math.sin(self.t2))
         y2_px = y1_px - int(L2 * scale * math.cos(self.t2))
 
-        # Upright Reference Line (Subtle vertical dashed laser guide)
+        # Vertical reference line
         if abs(self.t1) < 0.25 and abs(self.t2) < 0.25:
             guide_color = (*COLOR_PRIMARY, 60)
         else:
@@ -436,66 +407,55 @@ class InteractiveDoublePendulumEnv(gym.Env):
             pygame.draw.line(laser_surf, guide_color, (cart_pixel_x, dy), (cart_pixel_x, dy + 4), 1)
         self.screen.blit(laser_surf, (0, 0))
 
-        # 4. Pendulum Rods & Joints (Crisp, High-Resolution Hardware Rendering)
+        # Pendulum links and joints
         pygame.draw.line(self.screen, (220, 224, 230), (cart_pixel_x + 1, track_y + 1), (x1_px + 1, y1_px + 1), 7)
         pygame.draw.line(self.screen, COLOR_ROD_1, (cart_pixel_x, track_y), (x1_px, y1_px), 6)
         pygame.draw.line(self.screen, (220, 224, 230), (x1_px + 1, y1_px + 1), (x2_px + 1, y2_px + 1), 6)
         pygame.draw.line(self.screen, COLOR_ROD_2, (x1_px, y1_px), (x2_px, y2_px), 5)
 
-        # Elbow Joint
         pygame.draw.circle(self.screen, COLOR_CARD_BG, (x1_px, y1_px), 8)
         pygame.draw.circle(self.screen, COLOR_PRIMARY, (x1_px, y1_px), 6)
         pygame.draw.circle(self.screen, COLOR_CARD_BG, (x1_px, y1_px), 2)
 
-        # Tip Bob (Green accent showing upright state)
         tip_color = COLOR_SUCCESS if abs(self.t1) < 0.25 and abs(self.t2) < 0.25 else COLOR_AMBER
         pygame.draw.circle(self.screen, tip_color, (x2_px, y2_px), 9)
         pygame.draw.circle(self.screen, COLOR_CARD_BG, (x2_px - 2, y2_px - 2), 3)
 
-        # 5. Cart Rendering (Sleek Modern Carriage)
+        # Cart
         cart_w, cart_h = 78, 36
         cart_rect = (cart_pixel_x - cart_w // 2, track_y - cart_h + 8, cart_w, cart_h)
-        # Drop shadow
         pygame.draw.rect(self.screen, (215, 220, 228), (cart_rect[0] + 1, track_y + 4, cart_w, 4), border_radius=2)
-        # Body
         cart_body_color = COLOR_PRIMARY if not self.manual_mode else COLOR_AMBER
         pygame.draw.rect(self.screen, cart_body_color, cart_rect, border_radius=6)
-        # Center trim stripe
         pygame.draw.rect(self.screen, COLOR_CARD_BG, (cart_pixel_x - 18, track_y - cart_h + 14, 36, 4), border_radius=2)
 
-        # Wheels
         wheel_y = track_y + 4
         for wx in [cart_pixel_x - 24, cart_pixel_x + 24]:
             pygame.draw.circle(self.screen, COLOR_WHEEL, (wx, wheel_y), 7)
             pygame.draw.circle(self.screen, COLOR_CARD_BG, (wx, wheel_y), 3)
 
-        # Pivot Bearing
         pygame.draw.circle(self.screen, COLOR_CARD_BG, (cart_pixel_x, track_y), 9)
         pygame.draw.circle(self.screen, COLOR_PRIMARY, (cart_pixel_x, track_y), 6)
 
-        # 6. Top Header Bar (Clean, Spacious Human Design)
+        # Top bar
         hdr_rect = (20, 14, WINDOW_WIDTH - 40, 56)
         pygame.draw.rect(self.screen, COLOR_CARD_BG, hdr_rect, border_radius=8)
         pygame.draw.rect(self.screen, COLOR_BORDER, hdr_rect, width=1, border_radius=8)
 
-        # Human Title & Subtitle
         t_surf = self.title_font.render("Interactive Double Pendulum", True, COLOR_TEXT_DARK)
         self.screen.blit(t_surf, (38, 20))
         sub_title = "Physics Sandbox & Balancer"
         sub_surf = self.font.render(sub_title, True, COLOR_TEXT_MUTED)
         self.screen.blit(sub_surf, (38, 47))
 
-        # Header Buttons (Clean, Generously Spaced)
-        # 1. Mode Pill [750..890, 24..60]
-        mode_btn = pygame.Rect(750, 24, 140, 36)
+        mode_btn = pygame.Rect(800, 24, 140, 36)
         mode_bg = COLOR_AMBER if self.manual_mode else COLOR_SUCCESS
         pygame.draw.rect(self.screen, mode_bg, mode_btn, border_radius=18)
         mode_txt = "MANUAL DRIVE" if self.manual_mode else "AUTOPILOT"
         m_surf = self.font_bold.render(mode_txt, True, COLOR_CARD_BG)
         self.screen.blit(m_surf, (mode_btn.centerx - m_surf.get_width() // 2, mode_btn.centery - m_surf.get_height() // 2))
 
-        # 2. Pause Button [905..1005, 24..60]
-        pause_btn = pygame.Rect(905, 24, 100, 36)
+        pause_btn = pygame.Rect(955, 24, 100, 36)
         hover_pause = pause_btn.collidepoint(mouse_pos)
         p_bg = (241, 243, 246) if not hover_pause else (232, 236, 242)
         pygame.draw.rect(self.screen, p_bg, pause_btn, border_radius=6)
@@ -504,8 +464,7 @@ class InteractiveDoublePendulumEnv(gym.Env):
         p_surf = self.font_bold.render(p_txt, True, COLOR_DANGER if self.paused else COLOR_TEXT_DARK)
         self.screen.blit(p_surf, (pause_btn.centerx - p_surf.get_width() // 2, pause_btn.centery - p_surf.get_height() // 2))
 
-        # 3. Reset Button [1020..1110, 24..60]
-        reset_btn = pygame.Rect(1020, 24, 90, 36)
+        reset_btn = pygame.Rect(1070, 24, 90, 36)
         hover_reset = reset_btn.collidepoint(mouse_pos)
         r_bg = (241, 243, 246) if not hover_reset else (232, 236, 242)
         pygame.draw.rect(self.screen, r_bg, reset_btn, border_radius=6)
@@ -513,19 +472,17 @@ class InteractiveDoublePendulumEnv(gym.Env):
         r_surf = self.font_bold.render("RESET [R]", True, COLOR_TEXT_DARK)
         self.screen.blit(r_surf, (reset_btn.centerx - r_surf.get_width() // 2, reset_btn.centery - r_surf.get_height() // 2))
 
-        # 7. Left Physics Instruments Panel (Clean, Well-Spaced, No Overlaps!)
-        card_w, card_h = 260, 290
+        # Left telemetry card
+        card_w, card_h = 310, 266
         card_rect = (24, 86, card_w, card_h)
         pygame.draw.rect(self.screen, COLOR_CARD_BG, card_rect, border_radius=10)
         pygame.draw.rect(self.screen, COLOR_BORDER, card_rect, width=1, border_radius=10)
 
-        # Header of Left Card
         card_title = self.font_bold.render("PHYSICS METRICS", True, COLOR_TEXT_DARK)
         self.screen.blit(card_title, (40, 100))
 
-        # Speed Badge (Placed cleanly in top-right of card, no overlapping!)
         speed_badge = self.font.render(SPEED_LABELS[self.speed_idx], True, COLOR_PRIMARY)
-        self.screen.blit(speed_badge, (card_rect[0] + card_w - speed_badge.get_width() - 16, 102))
+        self.screen.blit(speed_badge, (card_rect[0] + card_w - speed_badge.get_width() - 16, 101))
 
         tip_y = L1 * math.cos(self.t1) + L2 * math.cos(self.t2)
         total_len = L1 + L2
@@ -533,7 +490,6 @@ class InteractiveDoublePendulumEnv(gym.Env):
         angle2_deg = math.degrees(self.t2)
         is_balanced = abs(self.t1) < 0.18 and abs(self.t2) < 0.18
 
-        # Human-readable physical measurements
         telemetry_rows = [
             ("Control Mode", "Manual Steer" if self.manual_mode else "Autopilot", COLOR_AMBER if self.manual_mode else COLOR_SUCCESS),
             ("Balance State", "Upright Balanced" if is_balanced else "Stabilizing...", COLOR_SUCCESS if is_balanced else COLOR_AMBER),
@@ -545,24 +501,24 @@ class InteractiveDoublePendulumEnv(gym.Env):
             ("Tip Height", f"{tip_y:+.2f} / {total_len:.2f} m", COLOR_SUCCESS if tip_y > 0.85 else COLOR_AMBER),
         ]
 
-        row_y = 132
+        row_y = 134
         for label, val, val_color in telemetry_rows:
             lbl_surf = self.font.render(label, True, COLOR_TEXT_MUTED)
             val_surf = self.font_bold.render(val, True, val_color)
             self.screen.blit(lbl_surf, (40, row_y))
             self.screen.blit(val_surf, (card_rect[0] + card_w - val_surf.get_width() - 16, row_y))
-            row_y += 18
+            row_y += 22
 
-        # Horizontal Cart Position Slider Bar inside Telemetry Card
-        meter_y = row_y + 8
+        # Cart position bar
+        meter_y = row_y + 10
         meter_w = card_w - 32
         pygame.draw.rect(self.screen, COLOR_GRID, (40, meter_y, meter_w, 6), border_radius=3)
         cart_ratio = (self.cart_x + TRACK_LIMIT) / (2.0 * TRACK_LIMIT)
         pin_x = int(40 + cart_ratio * meter_w)
         pygame.draw.circle(self.screen, COLOR_PRIMARY, (pin_x, meter_y + 3), 5)
 
-        # 8. Right Panel: Stability Monitor (Clean, Informative)
-        graph_w, graph_h = 260, 180
+        # Right balance history card
+        graph_w, graph_h = 310, 180
         graph_rect = (WINDOW_WIDTH - graph_w - 24, 86, graph_w, graph_h)
         pygame.draw.rect(self.screen, COLOR_CARD_BG, graph_rect, border_radius=10)
         pygame.draw.rect(self.screen, COLOR_BORDER, graph_rect, width=1, border_radius=10)
@@ -572,12 +528,10 @@ class InteractiveDoublePendulumEnv(gym.Env):
         gs_surf = self.font.render("Vertical Alignment", True, COLOR_TEXT_MUTED)
         self.screen.blit(gs_surf, (graph_rect[0] + 16, 122))
 
-        # Status badge inside graph card
         stat_txt = "99% Upright" if is_balanced else "Recovering"
         st_surf = self.font_bold.render(stat_txt, True, COLOR_SUCCESS if is_balanced else COLOR_AMBER)
-        self.screen.blit(st_surf, (graph_rect[0] + graph_w - st_surf.get_width() - 16, 102))
+        self.screen.blit(st_surf, (graph_rect[0] + graph_w - st_surf.get_width() - 16, 100))
 
-        # Plot canvas
         plot_x = graph_rect[0] + 16
         plot_y = 144
         plot_w = graph_w - 32
@@ -585,11 +539,9 @@ class InteractiveDoublePendulumEnv(gym.Env):
         pygame.draw.rect(self.screen, COLOR_BG, (plot_x, plot_y, plot_w, plot_h), border_radius=6)
         pygame.draw.rect(self.screen, COLOR_BORDER, (plot_x, plot_y, plot_w, plot_h), width=1, border_radius=6)
 
-        # Target upright horizontal line
         target_py = plot_y + int(plot_h * 0.15)
         pygame.draw.line(self.screen, COLOR_SUCCESS, (plot_x, target_py), (plot_x + plot_w, target_py), 1)
 
-        # Plot curve
         if len(self.height_history) > 2:
             pts = []
             for i, h in enumerate(self.height_history):
@@ -601,19 +553,19 @@ class InteractiveDoublePendulumEnv(gym.Env):
             if len(pts) >= 2:
                 pygame.draw.lines(self.screen, COLOR_PRIMARY, False, pts, 2)
 
-        # 9. Bottom Control Hotkey Bar (Clean, Friendly Pill Chips)
+        # Bottom controls bar
         bot_rect = (20, WINDOW_HEIGHT - 56, WINDOW_WIDTH - 40, 42)
         pygame.draw.rect(self.screen, COLOR_CARD_BG, bot_rect, border_radius=8)
         pygame.draw.rect(self.screen, COLOR_BORDER, bot_rect, width=1, border_radius=8)
 
         ctrl_chips = [
             ("Mouse Move", "Steer Cart"),
-            ("A / D or Left / Right", "Drive Cart"),
+            ("A/D or Arrows", "Drive Cart"),
             ("M", "Autopilot / Manual"),
             ("Space", "Disturbance Kick"),
             ("P", "Pause"),
             ("R", "Reset"),
-            ("▲ / ▼", "Speed"),
+            ("Up / Down", "Speed"),
         ]
 
         chip_x = 36
@@ -621,9 +573,9 @@ class InteractiveDoublePendulumEnv(gym.Env):
             k_surf = self.font_bold.render(f"[{key_badge}]", True, COLOR_PRIMARY)
             d_surf = self.font.render(desc, True, COLOR_TEXT_MUTED)
             self.screen.blit(k_surf, (chip_x, WINDOW_HEIGHT - 44))
-            self.screen.blit(d_surf, (chip_x + k_surf.get_width() + 4, WINDOW_HEIGHT - 44))
-            chip_x += k_surf.get_width() + d_surf.get_width() + 16
-            if chip_x > WINDOW_WIDTH - 120:
+            self.screen.blit(d_surf, (chip_x + k_surf.get_width() + 5, WINDOW_HEIGHT - 43))
+            chip_x += k_surf.get_width() + d_surf.get_width() + 18
+            if chip_x > WINDOW_WIDTH - 40:
                 break
 
         pygame.display.flip()
@@ -637,21 +589,15 @@ class InteractiveDoublePendulumEnv(gym.Env):
 
 
 def predict_action(model, obs):
-    """
-    Direct PyTorch inference from the PPO policy network.
-    """
+    # Query the policy mean directly so SB3 doesn't sample exploration noise at inference
     with torch.no_grad():
         obs_t = torch.as_tensor(obs, dtype=torch.float32).unsqueeze(0)
         dist = model.policy.get_distribution(obs_t)
-        action = dist.mode().cpu().numpy()[0]
-        return action
+        return dist.mode().cpu().numpy()[0]
 
 
 def train_policy_full_speed(model, num_samples=25000, epochs=250):
-    """
-    Trains the neural network policy at maximum CPU speed without UI rendering
-    to achieve rock-solid balance and recovery capabilities before GUI launch.
-    """
+    """Behavior-clone the PPO policy on LQR state-action pairs before launching the UI."""
     print("\n" + "=" * 68)
     print("           Interactive Double Pendulum Balancer Engine               ")
     print("=" * 68)
@@ -704,9 +650,7 @@ def train_policy_full_speed(model, num_samples=25000, epochs=250):
 
 
 def evaluate_accuracy(model, num_eval_steps=1000):
-    """
-    Evaluates the trained model across dynamic targets and prints benchmark results.
-    """
+    """Run a headless step-response benchmark across shifting cart targets."""
     print("[2/2] Running Benchmark across dynamic targets and maneuvers...")
     eval_env = InteractiveDoublePendulumEnv(render_mode=None)
     obs, _ = eval_env.reset()
@@ -715,7 +659,6 @@ def evaluate_accuracy(model, num_eval_steps=1000):
     errors = []
 
     for step in range(num_eval_steps):
-        # Steer target across rail
         if step < 200:
             eval_env.target_x = 0.8
         elif step < 400:
@@ -753,7 +696,6 @@ def evaluate_accuracy(model, num_eval_steps=1000):
 
 
 if __name__ == "__main__":
-    # 1. Initialize Headless Environment & Policy
     dummy_env = InteractiveDoublePendulumEnv(render_mode=None)
     model = PPO(
         "MlpPolicy",
@@ -766,13 +708,10 @@ if __name__ == "__main__":
         verbose=0
     )
 
-    # 2. Train at full speed BEFORE GUI displays so it works automatically
+    # Pre-train headless before opening the window
     train_policy_full_speed(model, num_samples=25000, epochs=250)
-
-    # 3. Evaluate and compute accuracy score
     evaluate_accuracy(model, num_eval_steps=1000)
 
-    # 4. Launch Clean, High-Resolution Interactive Sandbox (1200 x 760)
     print("Launching Interactive Sandbox...")
     print("Controls:")
     print("  - [Mouse Move / Drag] or [Arrow Keys]: Drive cart (pendulum stays balanced at top!)")
@@ -786,11 +725,8 @@ if __name__ == "__main__":
 
     try:
         while not ui_env.should_close:
-            # Predict action exclusively using the trained RL neural network
             action = predict_action(model, obs)
             obs, reward, terminated, truncated, _ = ui_env.step(action)
-
-            # Render once per frame with live updated telemetry
             ui_env.render()
 
     except KeyboardInterrupt:
